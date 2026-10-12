@@ -18,6 +18,10 @@ export NEW_RELIC_ACCOUNT_ID="your-account-id"
   - `--tags` — only show apps with a matching tag (e.g. `aiEnabledApp:true`)
   - `--name` — look up one specific app by name
   - `--since` — how far back to look (default `7 days ago`)
+- **`newrelic aimonitoring events eval types`** — list the built-in (non-custom) managed evaluation types available in AI Monitoring
+- **`newrelic aimonitoring events eval failures`** — find the evaluator reasons recorded for failures of a given evaluation metric
+  - `--metric` (required) — the evaluation `metricName` to filter by (e.g. `JAILBREAK`; see `events eval types` for the built-in list)
+  - `--since` (default `7 days ago`), `--limit` (default `100`, the NRQL `LIMIT`)
 
 ## Command Reference
 
@@ -81,6 +85,34 @@ newrelic aimonitoring events --type message --select "content"
 
 > If `content` comes back empty, it's likely because the APM agent has content recording turned off — many customers disable it by default to avoid capturing sensitive prompt/response text.
 
+### `aimonitoring events eval types` - List built-in managed evaluation types
+
+Lists the enum values of `EntityManagementManagedEvaluationType` — the built-in (non-custom) LLM evaluation types available in AI Monitoring — merged with the active account's configured `threshold` and `enabled` state for each type, where configured.
+
+```bash
+newrelic aimonitoring events eval types
+```
+
+**Response:**
+```json
+[
+  {"name": "JAILBREAK", "description": "Detects jailbreak attempts", "enabled": true, "threshold": 0.15},
+  {"name": "TOPIC_CONTROL", "description": "Validates topic control and consistency", "enabled": false, "threshold": 0.5}
+]
+```
+
+### `aimonitoring events eval failures` - Find evaluator reasons for failures of an evaluation metric
+
+Runs a NRQL query against `AiEvaluation` events to find the `evaluatorReason` values recorded for failures of a given evaluation metric.
+
+**Flags:** `--metric` (required, e.g. `JAILBREAK`), `--since` (default `7 days ago`), `--limit` (default `100`).
+
+```bash
+newrelic aimonitoring events eval failures --metric JAILBREAK --since "7 days ago"
+```
+
+> Equivalent to: `SELECT evaluatorReason FROM AiEvaluation WHERE (passed = false OR verdict = 'FAILED') AND metricName = 'JAILBREAK' SINCE 7 days ago LIMIT 100`
+
 ## Directory Structure
 
 ```
@@ -88,9 +120,14 @@ internal/aimonitoring/
 ├── README.md                        # This file
 ├── command.go                       # Root command
 ├── command_events.go                # events command
+├── command_events_eval.go           # events eval command group
+├── command_events_eval_types.go     # events eval types command
+├── command_events_eval_failures.go  # events eval failures command
 ├── command_application.go           # application search command
 ├── command_test.go
 ├── command_events_test.go
+├── command_events_eval_types_test.go
+├── command_events_eval_failures_test.go
 └── command_application_test.go
 ```
 
