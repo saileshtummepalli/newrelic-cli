@@ -2,10 +2,10 @@ package aimonitoring
 
 import (
 	"encoding/base64"
+	"fmt"
 	"strconv"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/newrelic/newrelic-cli/internal/client"
@@ -14,30 +14,27 @@ import (
 	"github.com/newrelic/newrelic-cli/internal/utils"
 )
 
-// managedEvaluationTypeEnumQuery introspects the EntityManagementManagedEvaluationType
-// enum, which lists the built-in (non-custom) LLM evaluation types available
-// in AI Monitoring.
-const managedEvaluationTypeEnumQuery = `query GetManagedEvaluationTypeEnum {
-	__type(name: "EntityManagementManagedEvaluationType") {
-		name
-		kind
-		description
-		enumValues { name description }
-	}
-}`
+const (
+	managedEvaluationsEntityType = "MANAGED_EVALUATIONS"
+	managedEvaluationsFragment   = "EntityManagementManagedEvaluationEntity"
+	customEvaluationsEntityType  = "CUSTOM_EVALUATIONS"
+	customEvaluationsFragment    = "EntityManagementCustomEvaluationEntity"
+)
 
-// managedEvaluationConfigQuery finds the account's MANAGED_EVALUATIONS entity
-// and its per-type threshold/enabled configuration. entitySearch is scoped to
-// the whole organization (every account the caller can see), so results are
-// filtered client-side by the accountId encoded in each entity's ID.
-const managedEvaluationConfigQuery = `query GetManagedEvaluationConfigs($cursor: String) {
+// evaluationConfigQueryTemplate finds the account's managed or custom
+// evaluations entity (depending on the entitySearch type and inline fragment
+// substituted in) and its per-type threshold/enabled configuration.
+// entitySearch is scoped to the whole organization (every account the caller
+// can see), so results are filtered client-side by the accountId encoded in
+// each entity's ID.
+const evaluationConfigQueryTemplate = `query GetEvaluationConfigs($cursor: String) {
 	actor {
 		entityManagement {
-			entitySearch(query: "type = 'MANAGED_EVALUATIONS'", cursor: $cursor) {
+			entitySearch(query: "type = '%s'", cursor: $cursor) {
 				nextCursor
 				entities {
 					id
-					...on EntityManagementManagedEvaluationsEntity {
+					...on %s {
 						evaluations { evaluationType threshold enabled }
 					}
 				}
@@ -46,103 +43,56 @@ const managedEvaluationConfigQuery = `query GetManagedEvaluationConfigs($cursor:
 	}
 }`
 
-// managedEvaluationTypeEnum is the shape of the EntityManagementManagedEvaluationType enum.
-type managedEvaluationTypeEnum struct {
-	Name        string                           `json:"name"`
-	Kind        string                           `json:"kind"`
-	Description string                           `json:"description"`
-	EnumValues  []managedEvaluationTypeEnumValue `json:"enumValues"`
-}
-
-type managedEvaluationTypeEnumValue struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-}
-
-// managedEvaluationConfig is one entry of EntityManagementManagedEvaluationConfig,
-// the account's configured threshold/enabled state for a managed evaluation type.
-type managedEvaluationConfig struct {
+// evaluationConfig is one entry of EntityManagementManagedEvaluationConfig or
+// EntityManagementCustomEvaluationConfig, the account's configured
+// threshold/enabled state for an evaluation type.
+type evaluationConfig struct {
 	EvaluationType string  `json:"evaluationType"`
 	Threshold      float64 `json:"threshold"`
 	Enabled        bool    `json:"enabled"`
 }
 
-// managedEvaluationTypeInfo is a managed evaluation type merged with the
-// account's configured threshold/enabled state, when available.
-type managedEvaluationTypeInfo struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Enabled     *bool    `json:"enabled,omitempty"`
-	Threshold   *float64 `json:"threshold,omitempty"`
-}
+var evalTypesCustom bool
 
 var cmdEventsEvalTypes = &cobra.Command{
 	Use:   "types",
-	Short: "List the built-in AI Monitoring managed evaluation types",
-	Long: `List the built-in AI Monitoring managed evaluation types
+	Short: "List the account's configured AI Monitoring evaluation types",
+	Long: `List the account's configured AI Monitoring evaluation types
 
-The types command lists the enum values of EntityManagementManagedEvaluationType
-— the built-in (non-custom) LLM evaluation types available in AI Monitoring —
-along with the active account's configured threshold and enabled state for
-each type, where configured.
+The types command lists the active account's configured LLM evaluation
+types in AI Monitoring, along with each type's configured threshold and
+enabled state. Use --managed (the default) for built-in evaluation types,
+or --custom for custom evaluation types.
 `,
-	Example: `newrelic aimonitoring events eval types`,
-	PreRun:  client.RequireClient,
+	Example: `newrelic aimonitoring events eval types --managed
+newrelic aimonitoring events eval types --custom`,
+	PreRun: client.RequireClient,
 	Run: func(cmd *cobra.Command, args []string) {
-		enum, err := fetchManagedEvaluationTypes()
-		utils.LogIfFatal(err)
-
-		if enum == nil {
-			log.Fatal("EntityManagementManagedEvaluationType was not found")
+		entitySearchType, fragmentType := managedEvaluationsEntityType, managedEvaluationsFragment
+		if evalTypesCustom {
+			entitySearchType, fragmentType = customEvaluationsEntityType, customEvaluationsFragment
 		}
 
 		accountID := configAPI.RequireActiveProfileAccountID()
 
-		configs, err := fetchManagedEvaluationConfigs(accountID)
+		configs, err := fetchEvaluationConfigs(entitySearchType, fragmentType, accountID)
 		utils.LogIfFatal(err)
 
-		configByType := make(map[string]managedEvaluationConfig, len(configs))
-		for _, c := range configs {
-			configByType[c.EvaluationType] = c
-		}
-
-		results := make([]managedEvaluationTypeInfo, 0, len(enum.EnumValues))
-		for _, v := range enum.EnumValues {
-			info := managedEvaluationTypeInfo{Name: v.Name, Description: v.Description}
-			if c, ok := configByType[v.Name]; ok {
-				info.Enabled = &c.Enabled
-				info.Threshold = &c.Threshold
-			}
-			results = append(results, info)
-		}
-
-		utils.LogIfFatal(output.Print(results))
+		utils.LogIfFatal(output.Print(configs))
 	},
 }
 
-// fetchManagedEvaluationTypes resolves the EntityManagementManagedEvaluationType
-// enum via a NerdGraph introspection query.
-func fetchManagedEvaluationTypes() (*managedEvaluationTypeEnum, error) {
-	var resp struct {
-		Type *managedEvaluationTypeEnum `json:"__type"`
-	}
-
-	if err := client.NRClient.NerdGraph.QueryWithResponseAndContext(utils.SignalCtx, managedEvaluationTypeEnumQuery, nil, &resp); err != nil {
-		return nil, err
-	}
-
-	return resp.Type, nil
-}
-
-// fetchManagedEvaluationConfigs returns the given account's configured
-// threshold/enabled state per managed evaluation type, paging through
-// entitySearch until the account's MANAGED_EVALUATIONS entity is found. It
-// returns a nil slice, with no error, if the account has no such entity.
-func fetchManagedEvaluationConfigs(accountID int) ([]managedEvaluationConfig, error) {
+// fetchEvaluationConfigs returns the given account's configured
+// threshold/enabled state per evaluation type, paging through entitySearch
+// until the account's evaluations entity is found. It returns a nil slice,
+// with no error, if the account has no such entity.
+func fetchEvaluationConfigs(entitySearchType string, fragmentType string, accountID int) ([]evaluationConfig, error) {
 	type entity struct {
-		ID          string                    `json:"id"`
-		Evaluations []managedEvaluationConfig `json:"evaluations"`
+		ID          string             `json:"id"`
+		Evaluations []evaluationConfig `json:"evaluations"`
 	}
+
+	query := fmt.Sprintf(evaluationConfigQueryTemplate, entitySearchType, fragmentType)
 
 	var cursor *string
 	for {
@@ -158,7 +108,7 @@ func fetchManagedEvaluationConfigs(accountID int) ([]managedEvaluationConfig, er
 		}
 
 		variables := map[string]interface{}{"cursor": cursor}
-		if err := client.NRClient.NerdGraph.QueryWithResponseAndContext(utils.SignalCtx, managedEvaluationConfigQuery, variables, &resp); err != nil {
+		if err := client.NRClient.NerdGraph.QueryWithResponseAndContext(utils.SignalCtx, query, variables, &resp); err != nil {
 			return nil, err
 		}
 
@@ -195,4 +145,9 @@ func entityAccountID(id string) int {
 
 func init() {
 	cmdEventsEval.AddCommand(cmdEventsEvalTypes)
+
+	var evalTypesManaged bool
+	cmdEventsEvalTypes.Flags().BoolVar(&evalTypesManaged, "managed", false, "list configured built-in (managed) AI Monitoring evaluation types (default)")
+	cmdEventsEvalTypes.Flags().BoolVar(&evalTypesCustom, "custom", false, "list configured custom AI Monitoring evaluation types")
+	cmdEventsEvalTypes.MarkFlagsMutuallyExclusive("managed", "custom")
 }
